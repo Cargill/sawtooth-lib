@@ -211,10 +211,13 @@ impl BlockPublisher {
     ///   scheduler; the caller will need to wait for these batches to be executed or new batches
     ///   to submitted and executed before they can successfully summarize the block.
     pub fn summarize_block(&self) -> Result<Vec<u8>, BlockPublisherError> {
+        debug!("Summarizing block");
         let mut candidate_block = self
             .candidate_block
             .lock()
             .map_err(|_| BlockPublisherError::Internal("Candidate block lock poisoned".into()))?;
+
+        debug!("Got candidate block");
 
         if let Some(mut candidate_block) = candidate_block.as_mut() {
             self.complete_candidate_block(&mut candidate_block)?;
@@ -240,10 +243,13 @@ impl BlockPublisher {
     ///   scheduler; the caller will need to wait for these batches to be executed or new batches
     ///   to submitted and executed before they can successfully finalize the block.
     pub fn finalize_block(&self, consensus_data: Vec<u8>) -> Result<String, BlockPublisherError> {
+        debug!("Finalizing block");
         let mut candidate_block = self
             .candidate_block
             .lock()
             .map_err(|_| BlockPublisherError::Internal("Candidate block lock poisoned".into()))?;
+
+        debug!("Got candidate block");
 
         if let Some(mut candidate_block) = candidate_block.take() {
             self.complete_candidate_block(&mut candidate_block)?;
@@ -449,10 +455,14 @@ impl BlockPublisher {
         &self,
         mut candidate_block: &mut CandidateBlock,
     ) -> Result<(), BlockPublisherError> {
+        debug!("Starting candidate block completion");
+
         // Check if candidate block is already completed
         if candidate_block.summary.is_some() {
             return Ok(());
         }
+
+        debug!("Checking that non-injected batches were scheduled");
 
         // If only injected batches (or no batches at all) have been scheduled, the block is empty
         // and the caller will just have to wait until new batches are submitted.
@@ -466,19 +476,25 @@ impl BlockPublisher {
 
         candidate_block.scheduler.finalize()?;
 
+        debug!("Finalized");
+
         let mut batch_results = HashMap::new();
 
         // Wait for all injected batches to finish executing
         let mut injected_batch_ids = candidate_block.injected_batch_ids.clone();
+        debug!("Injected batches: {:?}", injected_batch_ids);
         loop {
             match candidate_block.batch_results.recv() {
                 Ok(Some(batch_result)) => {
+                    debug!("Got batch: {:?}", batch_result.batch.batch().header_signature());
                     injected_batch_ids.remove(batch_result.batch.batch().header_signature());
 
                     batch_results.insert(
                         batch_result.batch.batch().header_signature().to_string(),
                         batch_result,
                     );
+
+                    debug!("Remaining injected batches: {:?}", injected_batch_ids);
 
                     if injected_batch_ids.is_empty() {
                         break;
@@ -497,6 +513,8 @@ impl BlockPublisher {
                 }
             }
         }
+
+        debug!("Got all injected batches: {:?}", batch_results);
 
         // Wait for at least one non-injected batch to finish executing
         if batch_results.len() == candidate_block.injected_batch_ids.len() {
@@ -522,8 +540,12 @@ impl BlockPublisher {
             }
         }
 
+        debug!("Got at least one non-injected batch result: {:?}", batch_results);
+
         // Cancel the scheduler
         candidate_block.scheduler.cancel()?;
+
+        debug!("Cancelled scheduler");
 
         // Collect any additional batch execution results that may have completed before the
         // scheduler was cancelled
@@ -533,6 +555,8 @@ impl BlockPublisher {
                 batch_result,
             );
         }
+
+        debug!("Got all results: {:?}", batch_results);
 
         // Parse the batch results into valid batches, invalid batches, and state changes
         let (valid_batches, invalid_batches, state_changes) = candidate_block
