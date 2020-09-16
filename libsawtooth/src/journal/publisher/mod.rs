@@ -454,51 +454,79 @@ impl BlockPublisher {
             return Ok(());
         }
 
-        // Cancel the scheduler and save all unexecuted batches in a `HashMap` indexed by batch ID
-        let mut descheduled_batches = candidate_block
-            .scheduler
-            .cancel()?
-            .into_iter()
-            .map(|batch| (batch.batch().header_signature().to_string(), batch))
-            .collect::<HashMap<_, _>>();
-
-        // If only injected batches were executed (or no batches were executed at all), reschedule
-        // the batches. If there are any batches to execute, they are in this list of descheduled
-        // batches; if there are no batches to execute, the caller will just have to wait until new
-        // batches are submitted.
-        let all_scheduled_batch_ids: HashSet<&String> =
-            HashSet::from_iter(candidate_block.scheduled_batch_ids.iter());
-        let descheduled_batch_ids =
-            HashSet::from_iter(descheduled_batches.iter().map(|(id, _)| id));
-        let executed_batch_ids = HashSet::from_iter(
-            all_scheduled_batch_ids
-                .difference(&descheduled_batch_ids)
-                .cloned()
-                .cloned(),
-        );
-        if executed_batch_ids.is_subset(&candidate_block.injected_batch_ids) {
-            schedule_batches(
-                descheduled_batches
-                    .into_iter()
-                    .map(|(_, batch)| batch)
-                    .collect(),
-                &self.commit_store,
-                candidate_block,
-            )?;
+        // If only injected batches (or no batches at all) have been scheduled, the block is empty
+        // and the caller will just have to wait until new batches are submitted.
+        if candidate_block
+            .scheduled_batch_ids
+            .iter()
+            .all(|id| candidate_block.injected_batch_ids.contains(id))
+        {
             return Err(BlockCompletionError::BlockEmpty.into());
-        }
-
-        // If any injected batches were descheduled, reschedule them to ensure they get executed
-        for id in &candidate_block.injected_batch_ids {
-            if let Some(batch) = descheduled_batches.remove(id) {
-                candidate_block.scheduler.add_batch(batch)?;
-            }
         }
 
         candidate_block.scheduler.finalize()?;
 
-        // Collect batch execution results in a `HashMap` indexed by batch ID
         let mut batch_results = HashMap::new();
+
+        // Wait for all injected batches to finish executing
+        let mut injected_batch_ids = candidate_block.injected_batch_ids.clone();
+        loop {
+            match candidate_block.batch_results.recv() {
+                Ok(Some(batch_result)) => {
+                    injected_batch_ids.remove(batch_result.batch.batch().header_signature());
+
+                    batch_results.insert(
+                        batch_result.batch.batch().header_signature().to_string(),
+                        batch_result,
+                    );
+
+                    if injected_batch_ids.is_empty() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    return Err(BlockPublisherError::Internal(
+                        "Executor returned `None` result when more results were expected".into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(BlockPublisherError::Internal(
+                        "Executor result sender disconnected when more results were expected"
+                            .into(),
+                    ))
+                }
+            }
+        }
+
+        // Wait for at least one non-injected batch to finish executing
+        if batch_results.len() == candidate_block.injected_batch_ids.len() {
+            // Only injected batches have finished executing, so wait for one more batch to execute
+            match candidate_block.batch_results.recv() {
+                Ok(Some(batch_result)) => {
+                    batch_results.insert(
+                        batch_result.batch.batch().header_signature().to_string(),
+                        batch_result,
+                    );
+                }
+                Ok(None) => {
+                    return Err(BlockPublisherError::Internal(
+                        "Executor returned `None` result when more results were expected".into(),
+                    ))
+                }
+                Err(_) => {
+                    return Err(BlockPublisherError::Internal(
+                        "Executor result sender disconnected when more results were expected"
+                            .into(),
+                    ))
+                }
+            }
+        }
+
+        // Cancel the scheduler
+        candidate_block.scheduler.cancel()?;
+
+        // Collect any additional batch execution results that may have completed before the
+        // scheduler was cancelled
         while let Ok(Some(batch_result)) = candidate_block.batch_results.recv() {
             batch_results.insert(
                 batch_result.batch.batch().header_signature().to_string(),
